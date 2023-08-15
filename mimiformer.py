@@ -162,8 +162,13 @@ class DecoderBlock(torch.nn.Module):
     
 
 class Transformer(torch.nn.Module):
-    def __init__(self, vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate):
+    def __init__(self, vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate, batch_size):
         super(Transformer, self).__init__()
+
+        self.batch_size = batch_size
+        self.vocab_size = vocab_size
+        self.embedding_size = embedding_size
+        self.hidden_size = hidden_size
         
         self.embedding = torch.nn.Embedding(vocab_size, embedding_size)
         self.decoder1 = DecoderBlock(embedding_size, hidden_size, dropout_rate)
@@ -173,21 +178,21 @@ class Transformer(torch.nn.Module):
         
     def get_pos_matrix(self, x):
         # Positional encoding
-        sequence_length = x.shape[-1]
-        store = torch.zeros((batch_size, sequence_length, embedding_size))
+        batch_size, sequence_length = x.shape
+        store = torch.zeros((batch_size, sequence_length, self.embedding_size))
         for pos in range(sequence_length):
-            for i in range(0, embedding_size, 2):
-                denominator = 10000 ** (i / embedding_size)
+            for i in range(0, self.embedding_size, 2):
+                denominator = 10000 ** (i / self.embedding_size)
                 angles = torch.tensor([pos / denominator]) 
                 store[:, pos, i] = torch.sin(angles)
-                if i + 1 < embedding_size:
+                if i + 1 < self.embedding_size:
                     store[:, pos, i + 1] = torch.cos(angles)
         return store
+
 
     def forward(self, x):
         sequence_length = x.shape[1]
         mask = torch.tril(torch.ones(sequence_length, sequence_length)).to(x.device)
-        
         x = self.embedding(x) + self.get_pos_matrix(x)
         x, att_00 = self.decoder1(x, mask)
         x, att_01 = self.decoder2(x, mask)
@@ -198,7 +203,7 @@ class Transformer(torch.nn.Module):
         return out, [att_00, att_01]
         
 
-m = Transformer(vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate)
+m = Transformer(vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate, batch_size)
 
 # SDG instead of Adam, why?
 opt = torch.optim.SGD(m.parameters(), lr=0.01)
