@@ -11,13 +11,17 @@ import numpy as np
 from datasets import load_dataset
 import time
 
+# Ensure Deterministic Behavior
+torch.manual_seed(42)
+np.random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# Load Dataset
 dataset = load_dataset("roneneldan/TinyStories")
 
-# Generate the same random numbers
-torch.manual_seed(42)
-
 # %%
-sample_data = dataset["train"]['text'][:1000]
+sample_data = dataset["train"]['text'][:2000]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -36,14 +40,15 @@ with open("sentences.txt", "w") as f:
 # %%
 input_file = 'sentences.txt' 
 prefix = 'sentences'
-vocab_size = 2000
+vocab_size = 1000
 
 # 
 
 spm.SentencePieceTrainer.train(
     input=input_file, 
     model_prefix=prefix, 
-    vocab_size=vocab_size
+    vocab_size=vocab_size,
+    user_defined_symbols="<pad>,<sos>,<eos>"
 )
 
 # %%
@@ -53,6 +58,10 @@ class Tokenizer:
         self.sp.load(f'{prefix}.model')
         self.vocab_size = self.sp.get_piece_size()
 
+        self.PAD_TOKEN = self.sp.piece_to_id('<pad>')
+        self.SOS_TOKEN = self.sp.piece_to_id('<sos>')
+        self.EOS_TOKEN = self.sp.piece_to_id('<eos>')
+
     def encode(self, name):
         return self.sp.encode_as_ids(name)
 
@@ -61,13 +70,18 @@ class Tokenizer:
     
 tokenizer = Tokenizer()
 
-# for i in range(10):
-#     print(tokenizer.decode([i]))
-
-print(tokenizer.vocab_size)
-
+# %%
+def collate_fn(batch):
+    batch = sorted(batch, key=lambda x: len(x), reverse=True)
+    max_len = len(batch[0])
+    padded_batch = []
+    for sequence in batch:
+        padded_sequence = torch.cat([sequence, torch.tensor([tokenizer.PAD_TOKEN] * (max_len - len(sequence)), dtype=torch.long)])
+        padded_batch.append(padded_sequence)
+    return torch.stack(padded_batch)
 
 # %%
+batch_size = 10
 
 class Dataset(torch.utils.data.Dataset):
   def __init__(self):
@@ -76,19 +90,15 @@ class Dataset(torch.utils.data.Dataset):
     self.tokenizer = Tokenizer()
 
   def __len__(self):
-    # Return number of names
     return len(self.names)
 
   def __getitem__(self, idx):
-    # Get name at index
     name = self.names[idx]
-    # Return encoded name
     return torch.tensor(self.tokenizer.encode(name), dtype=torch.long)
 
 
 ds = Dataset()
-# dl = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, collate_fn=)
-dl = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
+dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
 # %%
 class TinyStoriesDataset(torch.utils.data.Dataset):
@@ -116,101 +126,84 @@ hidden_size = 11
 mask_dimensions = 1000
 dropout_rate = 0.1
 
-class BesSimpleTransformer(torch.nn.Module):
-  def __init__(self):
-    super(BesSimpleTransformer, self).__init__()
-    # Embedding part of the model - 7 is the embedding size
-    self.embedding    = torch.nn.Embedding(tokenizer.vocab_size, embedding_size)
-    self.pos_emb      = self.get_pos_matrix()
-    self.dropout = torch.nn.Dropout(dropout_rate)
-    # Mask tensor trick - if batch size is one, we might not need it - research it!
-    self.register_buffer('mask', torch.tril(torch.ones(mask_dimensions, mask_dimensions)))
-    # First decoder block
-    # 11 could be anything, if we have heads or batch_size this might change
-    self.layer_00_key = torch.nn.Linear(embedding_size, 11)
-    self.layer_00_qry = torch.nn.Linear(embedding_size, 11)
-    self.layer_00_val = torch.nn.Linear(embedding_size, 11)
-    self.layer_00_ffw = torch.nn.Linear(11, embedding_size)
-    self.layer_norm0 = torch.nn.LayerNorm(embedding_size)
-    # Second decoder block
-    self.layer_01_key = torch.nn.Linear(embedding_size, 11)
-    self.layer_01_qry = torch.nn.Linear(embedding_size, 11)
-    self.layer_01_val = torch.nn.Linear(embedding_size, 11)
-    self.layer_01_ffw = torch.nn.Linear(11, embedding_size)
-    self.layer_norm1 = torch.nn.LayerNorm(embedding_size)
-    # Output of the model
-    self.layer_norm2 = torch.nn.LayerNorm(embedding_size)
-    self.map_to_vocab = torch.nn.Linear(embedding_size, tokenizer.vocab_size)
+class DecoderBlock(torch.nn.Module):
+    def __init__(self, embedding_size, hidden_size, dropout_rate):
+        super(DecoderBlock, self).__init__()
+        
+        # Self-Attention Mechanism
+        self.key = torch.nn.Linear(embedding_size, hidden_size)
+        self.qry = torch.nn.Linear(embedding_size, hidden_size)
+        self.val = torch.nn.Linear(embedding_size, hidden_size)
+        
+        # Feed-forward Network
+        self.ffw = torch.nn.Linear(hidden_size, embedding_size)
+        
+        # Layer Norm & Dropout
+        self.layer_norm = torch.nn.LayerNorm(embedding_size)
+        self.dropout = torch.nn.Dropout(dropout_rate)
 
-  def forward(self, x):
-    emb = self.embedding(x)
-    pos = self.pos_emb[0:x.shape[0], :]
-    emb = emb + pos
+    def forward(self, x, mask):
+        # Self-Attention
+        key = self.key(x)
+        qry = self.qry(x)
+        val = self.val(x)
+        
+        att = torch.matmul(qry, key.transpose(-2, -1)) / math.sqrt(key.shape[1])
+        att = att.masked_fill(mask == 0, float('-inf'))
+        att = torch.nn.functional.softmax(att, dim=1)
+        
+        res = torch.matmul(att, val)
+        res = self.dropout(self.ffw(res))
+        
+        # Add & Norm
+        x = self.layer_norm(x + res)
+        
+        return x, att
     
-    # normalise
-    emb = self.layer_norm0(emb)
 
-    key = self.layer_00_key(emb)
-    qry = self.layer_00_qry(emb)
-    val = self.layer_00_val(emb)
-    att = torch.mm(qry, key.t())
+class Transformer(torch.nn.Module):
+    def __init__(self, vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate):
+        super(Transformer, self).__init__()
+        
+        self.embedding = torch.nn.Embedding(vocab_size, embedding_size)
+        self.decoder1 = DecoderBlock(embedding_size, hidden_size, dropout_rate)
+        self.decoder2 = DecoderBlock(embedding_size, hidden_size, dropout_rate)
+        self.final_layer_norm = torch.nn.LayerNorm(embedding_size)
+        self.map_to_vocab = torch.nn.Linear(embedding_size, vocab_size)
+        
+    def get_pos_matrix(self, x):
+        # Positional encoding
+        sequence_length = x.shape[-1]
+        store = torch.zeros((batch_size, sequence_length, embedding_size))
+        for pos in range(sequence_length):
+            for i in range(0, embedding_size, 2):
+                denominator = 10000 ** (i / embedding_size)
+                angles = torch.tensor([pos / denominator]) 
+                store[:, pos, i] = torch.sin(angles)
+                if i + 1 < embedding_size:
+                    store[:, pos, i + 1] = torch.cos(angles)
+        return store
 
-    att = att / math.sqrt(key.shape[1])
+    def forward(self, x):
+        sequence_length = x.shape[1]
+        mask = torch.tril(torch.ones(sequence_length, sequence_length)).to(x.device)
+        
+        x = self.embedding(x) + self.get_pos_matrix(x)
+        x, att_00 = self.decoder1(x, mask)
+        x, att_01 = self.decoder2(x, mask)
+        
+        x = self.final_layer_norm(x)
+        out = self.map_to_vocab(x)
+        
+        return out, [att_00, att_01]
+        
 
-    # mask from 0 to token end (square mask)
-    msk = self.mask[0:x.shape[0], 0:x.shape[0]]
-    # mask over tensor (same as adding it)
-    att = att.masked_fill(msk == 0, float('-inf'))
-    
-    att = torch.nn.functional.softmax(att, dim=1)
-    att_00 = att
-    res = torch.mm(att, val)
-    # this is the feed forward layer
-    res = self.dropout(res)
-    res = self.layer_00_ffw(res)
-    # add residual
-    res = res + emb
-    res1 = res
-    # normalise
-    res = self.layer_norm1(res)
-
-    # do it all again with new q, k, v
-    key = self.layer_01_key(res)
-    qry = self.layer_01_qry(res)
-    val = self.layer_01_val(res)
-    att = torch.mm(qry, key.t())
-    att = att / math.sqrt(key.shape[1])
-
-    msk = self.mask[0:x.shape[0], 0:x.shape[0]]
-    att = att.masked_fill(msk == 0, float('-inf'))
-    
-    att = torch.nn.functional.softmax(att, dim=1)
-    att_01 = att
-    res = torch.mm(att, val)
-    res = self.dropout(res)
-    res = self.layer_01_ffw(res)
-    # add and normalise
-    res = res1 + self.layer_norm2(res)
-
-    # map back to our 29 vocab (alphabet + pos, eos, sos)
-    out = self.map_to_vocab(res)
-    return out, [att_00, att_01]
-
-  def get_pos_matrix(self):
-    store = torch.zeros(mask_dimensions, embedding_size)
-    for pos in range(mask_dimensions):
-      # why do we do this range thing here?
-      for i in range(0, 7, 2):
-        denominator = 10000 ** (2 * i / 7)
-        store[pos, i] = math.sin(pos / denominator)
-        if i + 1 < 7: store[pos, i + 1] = math.cos(pos / denominator)
-    return store
-
-
-m = BesSimpleTransformer()
+m = Transformer(vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate)
 
 # SDG instead of Adam, why?
-opt = torch.optim.Adam(m.parameters(), lr=0.01)
+opt = torch.optim.SGD(m.parameters(), lr=0.01)
+
+print("Parameters: ", m.parameters())
 
 # %%
 loss_history = []
@@ -218,33 +211,31 @@ num_epochs = 10
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 save_path = f"models/{timestamp}_mimiformer.pth"
 
+
+# Derive sos and eos from tokenizer
+sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long)
+eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
+
 start = time.time()
 
 for epoch in range(num_epochs):
   for idx, batch in enumerate(dl):
 
-    # sos = torch.tensor([2])
-    # eos = torch.tensor([1])
-    # Derive sos and eos from tokenizer
-    sos = torch.tensor([tokenizer.sp.piece_to_id('<s>')], dtype=torch.long)
-    eos = torch.tensor([tokenizer.sp.piece_to_id('</s>')], dtype=torch.long)
+    # Add sos to the beginning of each sequence in the batch
+    x = [torch.cat([sos, b]) for b in batch]
+    y = [torch.cat([b, eos]) for b in batch]
+    # convert batch to tensor
+    x = torch.stack(x)
+    y = torch.stack(y)
 
-    # for each row in batch
-    x = batch[0]
-    # add sos to beginning of row
-    x = torch.cat([sos, x])
-    # In target tensor, add eos to end of each row and remove sos from start
-    y = torch.cat([x[1:], eos])
-
-    
     # run our batch through the whole transformer (attention1, ffw, attention2, ffw, linear)
     p, _ = m(x)
     # calculate cross-entropy loss between predicted token and target token
-    l = torch.nn.functional.cross_entropy(p, y)
+    l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
     # print loss every 1000 rows of dataset
-    if idx % 1000 == 0: 
-      loss_history.append(l.item())
+    if idx % 100 == 0: 
       print("Loss:", l.item())
+      loss_history.append(l.item())
     # backpropogate for every row
     l.backward()
     # What is the optimiser doing?  Why is it called after we have done backward pass?
@@ -257,8 +248,6 @@ for epoch in range(num_epochs):
 
 end = time.time()
 print(f"Training took {end - start:.2f} seconds")
-  
-  
 
 # %%
 xaxis = len(loss_history) + 1
@@ -277,71 +266,79 @@ tokens = []
 # Get all the tokens/pieces from SentencePiece
 all_tokens = [tokenizer.sp.id_to_piece(i) for i in range(tokenizer.vocab_size)]
 
-# Pick a random token/piece
-random_token = random.choice(all_tokens)
+batched_random = []
 
-# Convert the token to its corresponding ID
-x = torch.tensor([tokenizer.sp.piece_to_id(random_token)])
-print(tokenizer.decode(x.tolist()))
+for b in range(batch_size): 
+  # Pick a random token/piece
+  random_token = random.choice(all_tokens)
 
-sos = torch.tensor([tokenizer.sp.piece_to_id('<s>')])
-print("sos", sos.tolist())
-print("sos", sos)
-x = torch.cat([sos, x])
+  # Convert the token to its corresponding ID
+  x = torch.tensor([tokenizer.sp.piece_to_id(random_token)])
+  print(tokenizer.decode(x.tolist()))
 
-top_p_threshold = 0.5
+  x = torch.cat([sos, x]) 
+  batched_random.append(x)
+
+
+x = torch.stack(batched_random)
+
+top_k = 5
+p_index = batch_size
 
 while True:
-  tokens.append(x[-1].tolist())
-  print("token", tokens)
+  tokens.append(x[:, -1])
+
   # run our random start through transformer and get attention matricies out
   p, attention = m(x)
   # create probabilities from 29 token options
-  p = torch.nn.functional.softmax(p, dim=1)
-  probs = p[-1].tolist()
+  p = torch.nn.functional.softmax(p, dim=batch_size)
+
   # choose the best prediction (most probable next token according to tranformer)
-  p = torch.argmax(p, dim=1)
-
-  #choose from the top 5 most probable tokens
-  # sorted_probs = sorted(probs, reverse=True)
-  # top_p = 0
-  # for i in range(len(sorted_probs)):
-  #   top_p += sorted_probs[i]
-  #   if top_p > top_p_threshold:
-  #     break
-  # top_p = sorted_probs[:i+1]
-  # top_p = torch.tensor(top_p)
-  # p = torch.multinomial(top_p, 1)
-  # p = torch.multinomial(p, 1)
-
+  prediction = torch.argmax(p, dim=batch_size)[:, -1]
+  
   # unsqueeze to get the right dimensions for torch.cat
-  # dimensions of x = [1, 1] and dimensions of p = [1]
-  x = torch.cat([x, p[-1].unsqueeze(0)])
-  if p[-1] == 1 or len(p.tolist()) == 17: break
-print("Generate:", tokenizer.decode(x.tolist()))
+  x = torch.cat([x, prediction.unsqueeze(1)], dim=1)
+  if x.size(1) ==20: break
+for i in range(batch_size): 
+  print(f"Generated text for batch {i+1}:", tokenizer.decode(x[i].tolist()))
 
 # %%
-
 def plot_attention_heatmap(attention, tokens):
-    decoded_tokens = [tokenizer.decode([tok]) for tok in tokens]
+    # Convert tensor tokens to list of integers and then decode
+    decoded_tokens = []
+    for tok in tokens:
+        # If token tensor has more than one value, we need to handle it differently
+        if tok.numel() > 1:
+            decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
+        else:
+            decoded_tokens.append(tokenizer.decode([tok.item()]))
+    
     num_layers = len(attention)
-    fig, axes = plt.subplots(1, num_layers, figsize=(4*num_layers, 4))
-
-    for idx, att in enumerate(attention):
-        sns.heatmap(att.detach().numpy(), annot=False, cmap='viridis', ax=axes[idx], xticklabels=decoded_tokens, yticklabels=decoded_tokens)
-        axes[idx].set_title(f'Attention Layer {idx + 1}')
-        axes[idx].set_xticks(np.arange(len(decoded_tokens))+.5, minor=False)
-        axes[idx].set_yticks(np.arange(len(decoded_tokens))+.5, minor=False)
-        axes[idx].tick_params(axis='x', rotation=45)
-        axes[idx].tick_params(axis='y', rotation=0)
+    
+    # Adjust the subplots layout depending on the number of batches and layers
+    fig, axes = plt.subplots(batch_size, num_layers, figsize=(4*num_layers, 4*batch_size))
+    
+    # If there's only one batch and one layer, axes won't be 2D array, so we need to wrap it in a list
+    if batch_size == 1 and num_layers == 1:
+        axes = [[axes]]
+    elif batch_size == 1 or num_layers == 1:
+        axes = [axes]
+    
+    for batch_idx in range(batch_size):
+        for layer_idx in range(num_layers):
+            ax = axes[batch_idx][layer_idx]
+            sns.heatmap(attention[layer_idx][batch_idx].detach().numpy(), annot=False, cmap='viridis', ax=ax, xticklabels=decoded_tokens[batch_idx], yticklabels=decoded_tokens[batch_idx])
+            ax.set_title(f'Batch {batch_idx+1}, Attention Layer {layer_idx + 1}')
+            ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+            ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+            ax.tick_params(axis='x', rotation=45)
+            ax.tick_params(axis='y', rotation=0)
 
     plt.tight_layout()
     plt.show()
 
-
 # Assuming that you've tokenized 'x' and the tokens are stored in a variable called 'tokens'
 plot_attention_heatmap(attention, tokens)
 
-print(attention[0].shape)
 
 
