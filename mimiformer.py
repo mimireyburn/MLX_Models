@@ -1,5 +1,5 @@
 # %%
-!python3 --version
+# !python3 --version
 import random
 import torch
 import math
@@ -21,7 +21,7 @@ torch.backends.cudnn.benchmark = False
 dataset = load_dataset("roneneldan/TinyStories")
 
 # %%
-sample_data = dataset["train"]['text'][:2000]
+sample_data = dataset["train"]['text'][:10000]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -48,7 +48,7 @@ spm.SentencePieceTrainer.train(
     input=input_file, 
     model_prefix=prefix, 
     vocab_size=vocab_size,
-    user_defined_symbols="<pad>,<sos>,<eos>"
+    user_defined_symbols="<pad>,<s>,</s>"
 )
 
 # %%
@@ -59,14 +59,25 @@ class Tokenizer:
         self.vocab_size = self.sp.get_piece_size()
 
         self.PAD_TOKEN = self.sp.piece_to_id('<pad>')
-        self.SOS_TOKEN = self.sp.piece_to_id('<sos>')
-        self.EOS_TOKEN = self.sp.piece_to_id('<eos>')
+        self.SOS_TOKEN = self.sp.piece_to_id('<s>')
+        self.EOS_TOKEN = self.sp.piece_to_id('</s>')
+
+        self.decoding_mapping = {
+            self.SOS_TOKEN: '',  # Replace <s> with space during decoding
+            self.EOS_TOKEN: ''  # Replace <s> with space during decoding
+        }
 
     def encode(self, name):
         return self.sp.encode_as_ids(name)
 
     def decode(self, tokens):
-        return self.sp.decode_ids(tokens)
+        decoded_text = self.sp.decode_ids(tokens)
+        
+        # Replace special tokens during decoding
+        for token_id, replacement in self.decoding_mapping.items():
+            decoded_text = decoded_text.replace(self.sp.id_to_piece(token_id), replacement)
+        
+        return decoded_text
     
 tokenizer = Tokenizer()
 
@@ -78,10 +89,11 @@ def collate_fn(batch):
     for sequence in batch:
         padded_sequence = torch.cat([sequence, torch.tensor([tokenizer.PAD_TOKEN] * (max_len - len(sequence)), dtype=torch.long)])
         padded_batch.append(padded_sequence)
+
     return torch.stack(padded_batch)
 
 # %%
-batch_size = 10
+batch_size = 32
 
 class Dataset(torch.utils.data.Dataset):
   def __init__(self):
@@ -122,7 +134,7 @@ class TinyStoriesDataset(torch.utils.data.Dataset):
 
 # %%
 embedding_size = 32
-hidden_size = 11
+hidden_size = 10
 mask_dimensions = 1000
 dropout_rate = 0.1
 
@@ -189,7 +201,6 @@ class Transformer(torch.nn.Module):
                     store[:, pos, i + 1] = torch.cos(angles)
         return store
 
-
     def forward(self, x):
         sequence_length = x.shape[1]
         mask = torch.tril(torch.ones(sequence_length, sequence_length)).to(x.device)
@@ -206,13 +217,13 @@ class Transformer(torch.nn.Module):
 m = Transformer(vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate, batch_size)
 
 # SDG instead of Adam, why?
-opt = torch.optim.SGD(m.parameters(), lr=0.01)
+opt = torch.optim.Adam(m.parameters(), lr=0.01)
 
 print("Parameters: ", m.parameters())
 
 # %%
 loss_history = []
-num_epochs = 10
+num_epochs = 3
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 save_path = f"models/{timestamp}_mimiformer.pth"
 
@@ -222,7 +233,7 @@ sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long)
 eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
 
 start = time.time()
-
+it = 100
 for epoch in range(num_epochs):
   for idx, batch in enumerate(dl):
 
@@ -239,7 +250,8 @@ for epoch in range(num_epochs):
     l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
     # print loss every 1000 rows of dataset
     if idx % 100 == 0: 
-      print("Loss:", l.item())
+      print(f"Loss of {it}:", l.item())
+      it += 100
       loss_history.append(l.item())
     # backpropogate for every row
     l.backward()
@@ -260,9 +272,28 @@ print(xaxis)
 plt.plot(range(1, xaxis), loss_history, marker='o')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title('Loss every 1000 Datapoints')
+plt.title('Loss every 100 Datapoints')
 plt.grid(True)
 plt.show()
+
+# %%
+def sample(probs, temperature=1.0):
+    probs = torch.pow(probs, 1/temperature)
+    probs = probs / probs.sum()
+    return torch.multinomial(probs, 1)
+
+def top_p_sample(probs, top_p=0.9):
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=0)
+    indices_to_remove = cumulative_probs > top_p
+    sorted_probs[indices_to_remove] = 0
+    sorted_probs /= sorted_probs.sum()
+    return torch.multinomial(sorted_probs, 1)
+
+  # p = sample(probs, 0.9)
+
+  # print("Input:", tokenizer.decode(x.tolist()), "Prediction:", tokenizer.decode(p.tolist()) )
+  # x = torch.cat([x, p[-1].unsqueeze(0)])
 
 # %%
 
@@ -279,7 +310,7 @@ for b in range(batch_size):
 
   # Convert the token to its corresponding ID
   x = torch.tensor([tokenizer.sp.piece_to_id(random_token)])
-  print(tokenizer.decode(x.tolist()))
+  # print(tokenizer.decode(x.tolist()))
 
   x = torch.cat([sos, x]) 
   batched_random.append(x)
@@ -291,20 +322,25 @@ top_k = 5
 p_index = batch_size
 
 while True:
-  tokens.append(x[:, -1])
-
   # run our random start through transformer and get attention matricies out
   p, attention = m(x)
   # create probabilities from 29 token options
-  p = torch.nn.functional.softmax(p, dim=batch_size)
+  p = torch.nn.functional.softmax(p, dim=-1)
+  probs = p[:, -1]
+  probs[:, 3] = 0
+  # "<pad>" =  3
 
   # choose the best prediction (most probable next token according to tranformer)
-  prediction = torch.argmax(p, dim=batch_size)[:, -1]
+  p = sample(probs, 0.9)
+  # prediction = torch.argmax(p, dim=-1)[:, -1]
   
   # unsqueeze to get the right dimensions for torch.cat
-  x = torch.cat([x, prediction.unsqueeze(1)], dim=1)
+  x = torch.cat([x, p], dim=1)
   if x.size(1) ==20: break
 for i in range(batch_size): 
+  generated_text = tokenizer.decode((x[i].tolist()))
+  tokens = x[i].tolist()
+  print(tokens)
   print(f"Generated text for batch {i+1}:", tokenizer.decode(x[i].tolist()))
 
 # %%
@@ -312,11 +348,7 @@ def plot_attention_heatmap(attention, tokens):
     # Convert tensor tokens to list of integers and then decode
     decoded_tokens = []
     for tok in tokens:
-        # If token tensor has more than one value, we need to handle it differently
-        if tok.numel() > 1:
-            decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
-        else:
-            decoded_tokens.append(tokenizer.decode([tok.item()]))
+        decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
     
     num_layers = len(attention)
     
@@ -334,8 +366,8 @@ def plot_attention_heatmap(attention, tokens):
             ax = axes[batch_idx][layer_idx]
             sns.heatmap(attention[layer_idx][batch_idx].detach().numpy(), annot=False, cmap='viridis', ax=ax, xticklabels=decoded_tokens[batch_idx], yticklabels=decoded_tokens[batch_idx])
             ax.set_title(f'Batch {batch_idx+1}, Attention Layer {layer_idx + 1}')
-            ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
-            ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+            # ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+            # ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
             ax.tick_params(axis='x', rotation=45)
             ax.tick_params(axis='y', rotation=0)
 
@@ -344,6 +376,5 @@ def plot_attention_heatmap(attention, tokens):
 
 # Assuming that you've tokenized 'x' and the tokens are stored in a variable called 'tokens'
 plot_attention_heatmap(attention, tokens)
-
 
 
