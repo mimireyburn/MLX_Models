@@ -1,5 +1,3 @@
-# %%
-# !python3 --version
 import random
 import torch
 import math
@@ -10,6 +8,7 @@ import datetime
 import numpy as np
 from datasets import load_dataset
 import time
+import wandb
 
 # Ensure Deterministic Behavior
 torch.manual_seed(42)
@@ -17,11 +16,15 @@ np.random.seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# Load Dataset
-dataset = load_dataset("roneneldan/TinyStories")
+
+# %% [markdown]
+# Download Dataset
 
 # %%
-sample_data = dataset["train"]['text'][:10000]
+
+# Load Dataset
+dataset = load_dataset("roneneldan/TinyStories")
+sample_data = dataset["train"]['text'][:1000]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -37,21 +40,21 @@ lines = [line for line in lines if line.strip()]
 with open("sentences.txt", "w") as f:
     f.writelines(lines)
 
+# %% [markdown]
+# Tokenize
+
 # %%
 input_file = 'sentences.txt' 
 prefix = 'sentences'
 vocab_size = 1000
 
-# 
-
 spm.SentencePieceTrainer.train(
     input=input_file, 
     model_prefix=prefix, 
-    vocab_size=vocab_size,
-    user_defined_symbols="<pad>,<s>,</s>"
+    vocab_size=vocab_size, 
+    model_type='bpe' # 'unigram' or 'bpe'
 )
 
-# %%
 class Tokenizer:
     def __init__(self):
         self.sp = spm.SentencePieceProcessor()
@@ -62,26 +65,37 @@ class Tokenizer:
         self.SOS_TOKEN = self.sp.piece_to_id('<s>')
         self.EOS_TOKEN = self.sp.piece_to_id('</s>')
 
-        self.decoding_mapping = {
-            self.SOS_TOKEN: '',  # Replace <s> with space during decoding
-            self.EOS_TOKEN: ''  # Replace <s> with space during decoding
-        }
-
     def encode(self, name):
-        return self.sp.encode_as_ids(name)
+        return self.sp.encode(name, out_type=int)
 
     def decode(self, tokens):
-        decoded_text = self.sp.decode_ids(tokens)
-        
-        # Replace special tokens during decoding
-        for token_id, replacement in self.decoding_mapping.items():
-            decoded_text = decoded_text.replace(self.sp.id_to_piece(token_id), replacement)
-        
-        return decoded_text
+        return self.sp.decode(tokens, out_type=str)
     
 tokenizer = Tokenizer()
 
+# %% [markdown]
+# Create Dataset
+
 # %%
+batch_size = 32
+
+class Dataset(torch.utils.data.Dataset):
+  def __init__(self):
+    with open('sentences.txt', 'r') as f:
+      self.stories = f.read().replace('\n', '').split("</s>")
+    self.tokenizer = Tokenizer()
+
+  def __len__(self):
+    return len(self.stories)
+
+  def __getitem__(self, idx):
+    story = self.stories[idx]
+    return torch.tensor(self.tokenizer.encode(story), dtype=torch.long)
+  
+  def getMaxLen(self):
+    return max(len(story) for story in self.stories)
+
+
 def collate_fn(batch):
     batch = sorted(batch, key=lambda x: len(x), reverse=True)
     max_len = len(batch[0])
@@ -92,138 +106,133 @@ def collate_fn(batch):
 
     return torch.stack(padded_batch)
 
-# %%
-batch_size = 32
-
-class Dataset(torch.utils.data.Dataset):
-  def __init__(self):
-    with open('sentences.txt', 'r') as f:
-      self.names = f.read().split('\n')
-    self.tokenizer = Tokenizer()
-
-  def __len__(self):
-    return len(self.names)
-
-  def __getitem__(self, idx):
-    name = self.names[idx]
-    return torch.tensor(self.tokenizer.encode(name), dtype=torch.long)
-
 
 ds = Dataset()
 dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-# %%
-class TinyStoriesDataset(torch.utils.data.Dataset):
-    def __init__(self, data):
-        self.stories = data["story"]
-        self.tokenizer = Tokenizer()
-
-    def __len__(self):
-        return len(self.stories)
-
-    def __getitem__(self, idx):
-        story = self.stories[idx]
-        return torch.tensor(self.tokenizer.encode(story))
-
-# train_dataset = TinyStoriesDataset(dataset["train"])
-# train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
-
+print("Longest item in dataset:", ds.getMaxLen())
 
 # %% [markdown]
-# BESFORMER
+# Multi-headed Attention Mimi-Former
 
 # %%
-embedding_size = 32
+embedding_size = 64
 hidden_size = 10
 mask_dimensions = 1000
 dropout_rate = 0.1
+nheads = 2
 
-class DecoderBlock(torch.nn.Module):
-    def __init__(self, embedding_size, hidden_size, dropout_rate):
-        super(DecoderBlock, self).__init__()
-        
-        # Self-Attention Mechanism
-        self.key = torch.nn.Linear(embedding_size, hidden_size)
-        self.qry = torch.nn.Linear(embedding_size, hidden_size)
-        self.val = torch.nn.Linear(embedding_size, hidden_size)
-        
-        # Feed-forward Network
-        self.ffw = torch.nn.Linear(hidden_size, embedding_size)
-        
-        # Layer Norm & Dropout
-        self.layer_norm = torch.nn.LayerNorm(embedding_size)
-        self.dropout = torch.nn.Dropout(dropout_rate)
-
-    def forward(self, x, mask):
-        # Self-Attention
-        key = self.key(x)
-        qry = self.qry(x)
-        val = self.val(x)
-        
-        att = torch.matmul(qry, key.transpose(-2, -1)) / math.sqrt(key.shape[1])
-        att = att.masked_fill(mask == 0, float('-inf'))
-        att = torch.nn.functional.softmax(att, dim=1)
-        
-        res = torch.matmul(att, val)
-        res = self.dropout(self.ffw(res))
-        
-        # Add & Norm
-        x = self.layer_norm(x + res)
-        
-        return x, att
-    
-
-class Transformer(torch.nn.Module):
-    def __init__(self, vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate, batch_size):
-        super(Transformer, self).__init__()
-
-        self.batch_size = batch_size
-        self.vocab_size = vocab_size
+# Encase the above functions in a modular class
+class MHA_Transformer(torch.nn.Module):
+    def __init__(self, embedding_size, hidden_size, tokenizer, dropout_rate, nheads):
+        super(MHA_Transformer, self).__init__()
         self.embedding_size = embedding_size
         self.hidden_size = hidden_size
-        
-        self.embedding = torch.nn.Embedding(vocab_size, embedding_size)
-        self.decoder1 = DecoderBlock(embedding_size, hidden_size, dropout_rate)
-        self.decoder2 = DecoderBlock(embedding_size, hidden_size, dropout_rate)
-        self.final_layer_norm = torch.nn.LayerNorm(embedding_size)
-        self.map_to_vocab = torch.nn.Linear(embedding_size, vocab_size)
-        
-    def get_pos_matrix(self, x):
-        # Positional encoding
-        batch_size, sequence_length = x.shape
-        store = torch.zeros((batch_size, sequence_length, self.embedding_size))
-        for pos in range(sequence_length):
-            for i in range(0, self.embedding_size, 2):
-                denominator = 10000 ** (i / self.embedding_size)
-                angles = torch.tensor([pos / denominator]) 
-                store[:, pos, i] = torch.sin(angles)
-                if i + 1 < self.embedding_size:
-                    store[:, pos, i + 1] = torch.cos(angles)
-        return store
+        self.tokenizer = tokenizer
+        self.dropout_rate = dropout_rate
+        self.nheads = nheads
+        self.head_size = embedding_size // nheads
+        self.dim_k = self.head_size
 
+        self.embedding = torch.nn.Embedding(tokenizer.vocab_size, embedding_size)
+        self.query = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
+        self.key = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
+        self.value = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
+        self.linear = torch.nn.Linear(embedding_size, embedding_size)
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(embedding_size, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, embedding_size)
+        )
+        self.mha_norm = torch.nn.LayerNorm(embedding_size)
+        self.ffn_norm = torch.nn.LayerNorm(embedding_size)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.model_output = torch.nn.Linear(embedding_size, tokenizer.vocab_size)
+        self.softmax = torch.nn.Softmax(dim = -1)
+
+    def create_embedding(self, x):
+        emb = self.embedding(x)
+        pos = self.positional_encoding(x)
+        emb = emb + pos
+        return emb
+        
     def forward(self, x):
-        sequence_length = x.shape[1]
-        mask = torch.tril(torch.ones(sequence_length, sequence_length)).to(x.device)
-        x = self.embedding(x) + self.get_pos_matrix(x)
-        x, att_00 = self.decoder1(x, mask)
-        x, att_01 = self.decoder2(x, mask)
+        self.sequence_length = x.shape[1]
+        self.mask = torch.tril(torch.ones(self.sequence_length, self.sequence_length))
+        emb = x
+        query = self.query(emb)
+        key = self.key(emb)
+        value = self.value(emb)
         
-        x = self.final_layer_norm(x)
-        out = self.map_to_vocab(x)
+        query = self.split_heads(query, x.shape[0])
+        key = self.split_heads(key, x.shape[0])
+        value = self.split_heads(value, x.shape[0])
+
+        scores = torch.matmul(query, key.transpose(-1, -2))
+        scaled_scores = scores / torch.sqrt(torch.tensor(self.sequence_length))
+        masked_scores = scaled_scores.masked_fill(self.mask == 0, float('-inf'))
+        attention_weights = torch.nn.functional.softmax(masked_scores, dim = -1)
+
+        output = torch.matmul(attention_weights, value)
+        concat = output.permute(0, 2, 1, 3).contiguous()
+        concat = concat.view(x.shape[0], -1, self.embedding_size)
         
-        return out, [att_00, att_01]
-        
+        mha_output = self.linear(concat)
+        output = self.mha_norm(mha_output + emb)
+        ffn_output = self.ffn(output)
+        output = self.ffn_norm(ffn_output + output)
+        output = self.dropout(output)
+        return output
 
-m = Transformer(vocab_size, embedding_size, hidden_size, mask_dimensions, dropout_rate, batch_size)
+    def last_ffw_layer(self, output):
+        output = self.model_output(output)
+        probs = self.softmax(output)
+        return probs 
+    
+    def positional_encoding(self, x):
+        self.sequence_length = x.shape[1]
+        encoding = torch.zeros(self.sequence_length, self.embedding_size)
+        for pos in range(self.sequence_length):
+            for i in range(0, self.embedding_size, 2):
+                encoding[pos, i] = math.sin(pos / (10000 ** ((2 * i)/self.embedding_size)))
+                encoding[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1))/self.embedding_size)))
+        return encoding.unsqueeze(0)
 
-# SDG instead of Adam, why?
-opt = torch.optim.Adam(m.parameters(), lr=0.01)
+    def split_heads(self, x, batch_size):
+        x = x.view(batch_size, -1, self.nheads, self.head_size)
+        return x.permute(0, 2, 1, 3)
+    
+    def generate(self, x, length):
+        with torch.no_grad():
+            for i in range(length):
+                probs = self.forward(x)
+                predicted = torch.argmax(probs, dim = -1)
+                x = torch.cat((x, predicted[-1].unsqueeze(0)), dim = 0)
+        return x
+    
+    def run_six_blocks(self, x):
+        x = self.create_embedding(x)
+        for i in range(6):
+            x = self.forward(x)
+        last_layer = self.last_ffw_layer(x)
+        return last_layer
+    
 
-print("Parameters: ", m.parameters())
+# Train the model
+m = MHA_Transformer(embedding_size, hidden_size, tokenizer, dropout_rate, nheads)
+# m = m.run_six_blocks()
+opt = torch.optim.Adam(m.parameters(), lr = 0.01)
+
+num_params = sum(p.numel() for p in m.parameters())
+print(f'The model has {num_params:,} parameters')
+
+
+# %% [markdown]
+# Train
 
 # %%
 loss_history = []
-num_epochs = 3
+num_epochs = 10
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 save_path = f"models/{timestamp}_mimiformer.pth"
 
@@ -234,6 +243,20 @@ eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
 
 start = time.time()
 it = 100
+
+# Initialise wandb
+wandb.init(
+  project="Mimi's_Mimiformer",
+  name= "Two_headed_Mimiformer",
+  config={
+  "dataset": "sentences.txt",
+  "epochs": num_epochs,
+  "batch_size": batch_size,
+  "model_params": num_params,
+  }
+)
+
+
 for epoch in range(num_epochs):
   for idx, batch in enumerate(dl):
 
@@ -245,10 +268,12 @@ for epoch in range(num_epochs):
     y = torch.stack(y)
 
     # run our batch through the whole transformer (attention1, ffw, attention2, ffw, linear)
-    p, _ = m(x)
+    p = m.run_six_blocks(x)
     # calculate cross-entropy loss between predicted token and target token
     l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
-    # print loss every 1000 rows of dataset
+    # print loss every 100 rows of dataset
+
+    wandb.log({"loss": l.item()})
     if idx % 100 == 0: 
       print(f"Loss of {it}:", l.item())
       it += 100
@@ -327,8 +352,9 @@ while True:
   # create probabilities from 29 token options
   p = torch.nn.functional.softmax(p, dim=-1)
   probs = p[:, -1]
-  probs[:, 3] = 0
-  # "<pad>" =  3
+
+  # mask out all the padding tokens
+  probs[:, tokenizer.sp.piece_to_id('<pad>')] = 0
 
   # choose the best prediction (most probable next token according to tranformer)
   p = sample(probs, 0.9)
