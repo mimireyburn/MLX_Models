@@ -1,5 +1,3 @@
-# %%
-!python3 --version
 import random
 import torch
 import math
@@ -14,11 +12,13 @@ import wandb
 import torch.nn as nn
 import torch.nn.functional as F
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Ensure Deterministic Behavior
 torch.manual_seed(42)
 np.random.seed(42)
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 # %% [markdown]
@@ -240,7 +240,7 @@ class Transformer(nn.Module):
 # Model admin
 
 # %%
-m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate, num_blocks)
+m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate, num_blocks).to(device)
 opt = torch.optim.Adam(m.parameters(), lr = 0.01)
 
 num_params = sum(p.numel() for p in m.parameters())
@@ -286,6 +286,9 @@ for epoch in range(num_epochs):
     # Prepend sos and append eos tokens to sequences
     x = torch.stack([torch.cat([sos, b]) for b in batch])
     y = torch.stack([torch.cat([b, eos]) for b in batch])
+
+    x = x.to(device)
+    y = y.to(device)
 
     start_step = time.time()
     # Forward pass
@@ -353,7 +356,7 @@ for b in range(batch_size):
   batched_random.append(x)
 
 
-x = torch.stack(batched_random)
+x = torch.stack(batched_random).to(device)
 
 top_k = 5
 p_index = batch_size
