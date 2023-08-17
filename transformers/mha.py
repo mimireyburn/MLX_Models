@@ -28,7 +28,7 @@ torch.backends.cudnn.benchmark = False
 # Load Dataset
 dataset = load_dataset("roneneldan/TinyStories")
 
-sample_data = dataset["train"]['text'][:3000]
+sample_data = dataset["train"]['text'][:10000]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -50,7 +50,7 @@ with open("sentences.txt", "w") as f:
 # %%
 input_file = 'sentences.txt' 
 prefix = 'sentences'
-vocab_size = 750
+vocab_size = 2000
 
 spm.SentencePieceTrainer.train(
     input=input_file, 
@@ -117,12 +117,12 @@ print("Longest item in dataset:", ds.getMaxLen())
 # Multi-headed Attention Mimi-Former
 
 # %%
-embedding_size = 64
-hidden_size = 10
+embedding_size = 256
+hidden_size = 64
 mask_dimensions = 1000
 dropout_rate = 0.1
-n_heads = 4
-num_blocks = 6
+n_heads = 8
+num_blocks = 1
 
 class Head(nn.Module):
     def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate):
@@ -163,7 +163,7 @@ class Head(nn.Module):
         # Generate a mask for the lower triangular part of each matrix in the batch
         batch_size = attention_scores.size(0)
         size = attention_scores.size(1)
-        mask = torch.tril(torch.ones(batch_size, size, size), diagonal=0)
+        mask = torch.tril(torch.ones(batch_size, size, size), diagonal=0).to(attention_scores.device)
     
         # Create a tensor of -inf values with the same shape as attention_scores
         negative_inf = torch.full_like(attention_scores, float('-inf'))
@@ -173,44 +173,23 @@ class Head(nn.Module):
     
         return masked_attention_scores
 
-class TransformerBlock(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate):
-        super(TransformerBlock, self).__init__()
+        super(Transformer, self).__init__() 
+
+        self.embedding_size = embedding_size
+        self.embedding = nn.Embedding(vocab_size, embedding_size)
+
+        self.heads = nn.ModuleList([Head(embedding_size, n_heads, hidden_size, dropout_rate) for _ in range(n_heads)])
         
-        self.attention = Head(embedding_size, n_heads, hidden_size, dropout_rate)
-        self.norm1 = nn.LayerNorm(embedding_size)
-        self.norm2 = nn.LayerNorm(embedding_size)
+        # Assuming you want to retain the original embedding size after concatenating all head outputs
+        self.linear = nn.Linear(embedding_size * n_heads, embedding_size)
+
         self.ffn = nn.Sequential(
             nn.Linear(embedding_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, embedding_size)
         )
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, x):
-        # Multi-head attention with residual connection
-        attention_out = self.attention(x)
-        x = x + self.dropout(attention_out)
-        x = self.norm1(x)
-        
-        # Feed-forward neural network with residual connection
-        ffn_out = self.ffn(x)
-        x = x + self.dropout(ffn_out)
-        x = self.norm2(x)
-        
-        return x
-
-
-class Transformer(nn.Module):
-    def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate, n_blocks):
-        super(Transformer, self).__init__()
-
-        self.embedding_size = embedding_size
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
-        
-        # Create multiple Transformer blocks
-        self.blocks = nn.ModuleList([TransformerBlock(embedding_size, n_heads, hidden_size, dropout_rate) for _ in range(n_blocks)])
-        
         self.final_layer = nn.Linear(embedding_size, vocab_size)
 
     def get_pos_matrix(self, x):
@@ -224,23 +203,24 @@ class Transformer(nn.Module):
                 store[:, pos, i] = torch.sin(angles)
                 if i + 1 < self.embedding_size:
                     store[:, pos, i + 1] = torch.cos(angles)
-        return store
+        return store.to(x.device)
 
     def forward(self, input):
         embedded_input = self.embedding(input)
-        x = embedded_input + self.get_pos_matrix(input)
+        pos_encoded_input = embedded_input + self.get_pos_matrix(input)
         
-        for block in self.blocks:
-            x = block(x)
-        
-        output = self.final_layer(x)
+        heads_outputs = [head(pos_encoded_input) for head in self.heads]
+        concatenated_outputs = torch.cat(heads_outputs, dim=-1)
+        output = self.linear(concatenated_outputs)
+        output = self.ffn(output)
+        output = self.final_layer(output)
         return output
 
 # %% [markdown]
 # Model admin
 
 # %%
-m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate, num_blocks).to(device)
+m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate).to(device)
 opt = torch.optim.Adam(m.parameters(), lr = 0.01)
 
 num_params = sum(p.numel() for p in m.parameters())
@@ -248,9 +228,9 @@ print(f'The model has {num_params:,} parameters')
 
 num_epochs = 10
 
-title = str(input("Enter a run name: "))
+title = str(input("Are you ready to run???: "))
 
-title = f"Ep:{num_epochs}, Ba:{batch_size}, Emb:{embedding_size}, Hi:{hidden_size}, D/o:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}"
+title = f"Ep:{num_epochs}, Ba:{batch_size}, Emb:{embedding_size}, Hi:{hidden_size}, D/o:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}, GPU:{device.type}"
 
 wandb.init(
   project="Mimi's_Mimiformer",
@@ -267,6 +247,7 @@ wandb.init(
   "dropout_rate": dropout_rate,
   "nheads": n_heads,
   "num_blocks": num_blocks,
+  "GPU" : device.type
   }
 )
 
@@ -275,8 +256,8 @@ wandb.init(
 
 # %%
 # Derive sos and eos from tokenizer
-sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long)
-eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
+sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long).to(device)
+eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long).to(device)
 
 start = time.time()
 
@@ -284,11 +265,9 @@ start = time.time()
 for epoch in range(num_epochs):
   for idx, batch in enumerate(dl):
     # Prepend sos and append eos tokens to sequences
-    x = torch.stack([torch.cat([sos, b]) for b in batch])
-    y = torch.stack([torch.cat([b, eos]) for b in batch])
-
-    x = x.to(device)
-    y = y.to(device)
+    batch = batch.to(device)
+    x = torch.stack([torch.cat([sos, b]) for b in batch]).to(device)
+    y = torch.stack([torch.cat([b, eos]) for b in batch]).to(device)
 
     start_step = time.time()
     # Forward pass
@@ -305,6 +284,7 @@ for epoch in range(num_epochs):
 
     # Log and print
     wandb.log({"epoch": epoch, "train_loss": l.item(), "step_duration": step_duration})
+
 
 
 # Save the model and finish
@@ -384,37 +364,37 @@ for i in range(batch_size):
   print(f"Batch {i+1}:", tokenizer.decode(x[i].tolist()))
 
 # %%
-def plot_attention_heatmap(attention, tokens):
-    # Convert tensor tokens to list of integers and then decode
-    decoded_tokens = []
-    for tok in tokens:
-        decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
+# def plot_attention_heatmap(attention, tokens):
+#     # Convert tensor tokens to list of integers and then decode
+#     decoded_tokens = []
+#     for tok in tokens:
+#         decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
     
-    num_layers = len(attention)
+#     num_layers = len(attention)
     
-    # Adjust the subplots layout depending on the number of batches and layers
-    fig, axes = plt.subplots(batch_size, num_layers, figsize=(4*num_layers, 4*batch_size))
+#     # Adjust the subplots layout depending on the number of batches and layers
+#     fig, axes = plt.subplots(batch_size, num_layers, figsize=(4*num_layers, 4*batch_size))
     
-    # If there's only one batch and one layer, axes won't be 2D array, so we need to wrap it in a list
-    if batch_size == 1 and num_layers == 1:
-        axes = [[axes]]
-    elif batch_size == 1 or num_layers == 1:
-        axes = [axes]
+#     # If there's only one batch and one layer, axes won't be 2D array, so we need to wrap it in a list
+#     if batch_size == 1 and num_layers == 1:
+#         axes = [[axes]]
+#     elif batch_size == 1 or num_layers == 1:
+#         axes = [axes]
     
-    for batch_idx in range(batch_size):
-        for layer_idx in range(num_layers):
-            ax = axes[batch_idx][layer_idx]
-            sns.heatmap(attention[layer_idx][batch_idx].detach().numpy(), annot=False, cmap='viridis', ax=ax, xticklabels=decoded_tokens[batch_idx], yticklabels=decoded_tokens[batch_idx])
-            ax.set_title(f'Batch {batch_idx+1}, Attention Layer {layer_idx + 1}')
-            # ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
-            # ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
-            ax.tick_params(axis='x', rotation=45)
-            ax.tick_params(axis='y', rotation=0)
+#     for batch_idx in range(batch_size):
+#         for layer_idx in range(num_layers):
+#             ax = axes[batch_idx][layer_idx]
+#             sns.heatmap(attention[layer_idx][batch_idx].detach().numpy(), annot=False, cmap='viridis', ax=ax, xticklabels=decoded_tokens[batch_idx], yticklabels=decoded_tokens[batch_idx])
+#             ax.set_title(f'Batch {batch_idx+1}, Attention Layer {layer_idx + 1}')
+#             # ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+#             # ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
+#             ax.tick_params(axis='x', rotation=45)
+#             ax.tick_params(axis='y', rotation=0)
 
-    plt.tight_layout()
-    plt.show()
+#     plt.tight_layout()
+#     plt.show()
 
-# Assuming that you've tokenized 'x' and the tokens are stored in a variable called 'tokens'
-plot_attention_heatmap(attention, tokens)
+# # Assuming that you've tokenized 'x' and the tokens are stored in a variable called 'tokens'
+# plot_attention_heatmap(attention, tokens)
 
 
