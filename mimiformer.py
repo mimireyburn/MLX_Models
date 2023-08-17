@@ -1,3 +1,5 @@
+# %%
+!python3 --version
 import random
 import torch
 import math
@@ -9,22 +11,24 @@ import numpy as np
 from datasets import load_dataset
 import time
 import wandb
+import torch.nn as nn
+import torch.nn.functional as F
 
 # Ensure Deterministic Behavior
 torch.manual_seed(42)
 np.random.seed(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
 
 
 # %% [markdown]
 # Download Dataset
 
 # %%
-
 # Load Dataset
 dataset = load_dataset("roneneldan/TinyStories")
-sample_data = dataset["train"]['text'][:1000]
+
+sample_data = dataset["train"]['text'][:3000]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -46,14 +50,14 @@ with open("sentences.txt", "w") as f:
 # %%
 input_file = 'sentences.txt' 
 prefix = 'sentences'
-vocab_size = 1000
+vocab_size = 750
 
 spm.SentencePieceTrainer.train(
     input=input_file, 
     model_prefix=prefix, 
-    vocab_size=vocab_size, 
-    model_type='bpe' # 'unigram' or 'bpe'
+    vocab_size=vocab_size
 )
+
 
 class Tokenizer:
     def __init__(self):
@@ -61,7 +65,6 @@ class Tokenizer:
         self.sp.load(f'{prefix}.model')
         self.vocab_size = self.sp.get_piece_size()
 
-        self.PAD_TOKEN = self.sp.piece_to_id('<pad>')
         self.SOS_TOKEN = self.sp.piece_to_id('<s>')
         self.EOS_TOKEN = self.sp.piece_to_id('</s>')
 
@@ -77,12 +80,12 @@ tokenizer = Tokenizer()
 # Create Dataset
 
 # %%
-batch_size = 32
+batch_size = 64
 
 class Dataset(torch.utils.data.Dataset):
   def __init__(self):
     with open('sentences.txt', 'r') as f:
-      self.stories = f.read().replace('\n', '').split("</s>")
+      self.stories = f.readlines()
     self.tokenizer = Tokenizer()
 
   def __len__(self):
@@ -101,11 +104,9 @@ def collate_fn(batch):
     max_len = len(batch[0])
     padded_batch = []
     for sequence in batch:
-        padded_sequence = torch.cat([sequence, torch.tensor([tokenizer.PAD_TOKEN] * (max_len - len(sequence)), dtype=torch.long)])
+        padded_sequence = torch.cat([sequence, torch.tensor([0] * (max_len - len(sequence)), dtype=torch.long)])
         padded_batch.append(padded_sequence)
-
     return torch.stack(padded_batch)
-
 
 ds = Dataset()
 dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
@@ -120,186 +121,199 @@ embedding_size = 64
 hidden_size = 10
 mask_dimensions = 1000
 dropout_rate = 0.1
-nheads = 2
+n_heads = 4
+num_blocks = 6
 
-# Encase the above functions in a modular class
-class MHA_Transformer(torch.nn.Module):
-    def __init__(self, embedding_size, hidden_size, tokenizer, dropout_rate, nheads):
-        super(MHA_Transformer, self).__init__()
+class Head(nn.Module):
+    def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate):
+        super(Head, self).__init__()
         self.embedding_size = embedding_size
+        self.n_heads = n_heads
         self.hidden_size = hidden_size
-        self.tokenizer = tokenizer
         self.dropout_rate = dropout_rate
-        self.nheads = nheads
-        self.head_size = embedding_size // nheads
-        self.dim_k = self.head_size
+        self.head_size = embedding_size // n_heads
 
-        self.embedding = torch.nn.Embedding(tokenizer.vocab_size, embedding_size)
-        self.query = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
-        self.key = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
-        self.value = torch.nn.Linear(embedding_size, nheads * self.dim_k, bias = False)
-        self.linear = torch.nn.Linear(embedding_size, embedding_size)
-        self.ffn = torch.nn.Sequential(
-            torch.nn.Linear(embedding_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, embedding_size)
+        # Note: For each head, we have its own set of weights
+        self.keys = nn.ModuleList([nn.Linear(self.embedding_size, self.head_size, bias=False) for _ in range(n_heads)])
+        self.queries = nn.ModuleList([nn.Linear(self.embedding_size, self.head_size, bias=False) for _ in range(n_heads)])
+        self.values = nn.ModuleList([nn.Linear(self.embedding_size, self.head_size, bias=False) for _ in range(n_heads)])
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+    def forward(self, input): 
+        # Split the input across the heads
+        outputs = []
+        for i in range(self.n_heads):
+            q = self.queries[i](input)
+            k = self.keys[i](input)
+            v = self.values[i](input)
+
+            dim_k = q.shape[-1]
+
+            att = torch.matmul(q, k.transpose(-2, -1))
+            att = att / (dim_k ** 0.5)
+            att = self.apply_attention_mask(att)
+            att = F.softmax(att, dim=-1)
+            att = torch.matmul(att, v)
+            outputs.append(att)
+
+        # Concatenate the outputs along the last dimension
+        return torch.cat(outputs, dim=-1)
+
+    def apply_attention_mask(self, attention_scores):
+        # Generate a mask for the lower triangular part of each matrix in the batch
+        batch_size = attention_scores.size(0)
+        size = attention_scores.size(1)
+        mask = torch.tril(torch.ones(batch_size, size, size), diagonal=0)
+    
+        # Create a tensor of -inf values with the same shape as attention_scores
+        negative_inf = torch.full_like(attention_scores, float('-inf'))
+    
+        # Use torch.where to fill masked positions with -inf
+        masked_attention_scores = torch.where(mask.bool(), attention_scores, negative_inf)
+    
+        return masked_attention_scores
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate):
+        super(TransformerBlock, self).__init__()
+        
+        self.attention = Head(embedding_size, n_heads, hidden_size, dropout_rate)
+        self.norm1 = nn.LayerNorm(embedding_size)
+        self.norm2 = nn.LayerNorm(embedding_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, embedding_size)
         )
-        self.mha_norm = torch.nn.LayerNorm(embedding_size)
-        self.ffn_norm = torch.nn.LayerNorm(embedding_size)
-        self.dropout = torch.nn.Dropout(dropout_rate)
-        self.model_output = torch.nn.Linear(embedding_size, tokenizer.vocab_size)
-        self.softmax = torch.nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout_rate)
 
-    def create_embedding(self, x):
-        emb = self.embedding(x)
-        pos = self.positional_encoding(x)
-        emb = emb + pos
-        return emb
-        
     def forward(self, x):
-        self.sequence_length = x.shape[1]
-        self.mask = torch.tril(torch.ones(self.sequence_length, self.sequence_length))
-        emb = x
-        query = self.query(emb)
-        key = self.key(emb)
-        value = self.value(emb)
+        # Multi-head attention with residual connection
+        attention_out = self.attention(x)
+        x = x + self.dropout(attention_out)
+        x = self.norm1(x)
         
-        query = self.split_heads(query, x.shape[0])
-        key = self.split_heads(key, x.shape[0])
-        value = self.split_heads(value, x.shape[0])
-
-        scores = torch.matmul(query, key.transpose(-1, -2))
-        scaled_scores = scores / torch.sqrt(torch.tensor(self.sequence_length))
-        masked_scores = scaled_scores.masked_fill(self.mask == 0, float('-inf'))
-        attention_weights = torch.nn.functional.softmax(masked_scores, dim = -1)
-
-        output = torch.matmul(attention_weights, value)
-        concat = output.permute(0, 2, 1, 3).contiguous()
-        concat = concat.view(x.shape[0], -1, self.embedding_size)
+        # Feed-forward neural network with residual connection
+        ffn_out = self.ffn(x)
+        x = x + self.dropout(ffn_out)
+        x = self.norm2(x)
         
-        mha_output = self.linear(concat)
-        output = self.mha_norm(mha_output + emb)
-        ffn_output = self.ffn(output)
-        output = self.ffn_norm(ffn_output + output)
-        output = self.dropout(output)
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate, n_blocks):
+        super(Transformer, self).__init__()
+
+        self.embedding_size = embedding_size
+        self.embedding = nn.Embedding(vocab_size, embedding_size)
+        
+        # Create multiple Transformer blocks
+        self.blocks = nn.ModuleList([TransformerBlock(embedding_size, n_heads, hidden_size, dropout_rate) for _ in range(n_blocks)])
+        
+        self.final_layer = nn.Linear(embedding_size, vocab_size)
+
+    def get_pos_matrix(self, x):
+        # Positional encoding
+        batch_size, sequence_length = x.shape
+        store = torch.zeros((batch_size, sequence_length, self.embedding_size))
+        for pos in range(sequence_length):
+            for i in range(0, self.embedding_size, 2):
+                denominator = 10000 ** (i / self.embedding_size)
+                angles = torch.tensor([pos / denominator]) 
+                store[:, pos, i] = torch.sin(angles)
+                if i + 1 < self.embedding_size:
+                    store[:, pos, i + 1] = torch.cos(angles)
+        return store
+
+    def forward(self, input):
+        embedded_input = self.embedding(input)
+        x = embedded_input + self.get_pos_matrix(input)
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        output = self.final_layer(x)
         return output
 
-    def last_ffw_layer(self, output):
-        output = self.model_output(output)
-        probs = self.softmax(output)
-        return probs 
-    
-    def positional_encoding(self, x):
-        self.sequence_length = x.shape[1]
-        encoding = torch.zeros(self.sequence_length, self.embedding_size)
-        for pos in range(self.sequence_length):
-            for i in range(0, self.embedding_size, 2):
-                encoding[pos, i] = math.sin(pos / (10000 ** ((2 * i)/self.embedding_size)))
-                encoding[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1))/self.embedding_size)))
-        return encoding.unsqueeze(0)
+# %% [markdown]
+# Model admin
 
-    def split_heads(self, x, batch_size):
-        x = x.view(batch_size, -1, self.nheads, self.head_size)
-        return x.permute(0, 2, 1, 3)
-    
-    def generate(self, x, length):
-        with torch.no_grad():
-            for i in range(length):
-                probs = self.forward(x)
-                predicted = torch.argmax(probs, dim = -1)
-                x = torch.cat((x, predicted[-1].unsqueeze(0)), dim = 0)
-        return x
-    
-    def run_six_blocks(self, x):
-        x = self.create_embedding(x)
-        for i in range(6):
-            x = self.forward(x)
-        last_layer = self.last_ffw_layer(x)
-        return last_layer
-    
-
-# Train the model
-m = MHA_Transformer(embedding_size, hidden_size, tokenizer, dropout_rate, nheads)
-# m = m.run_six_blocks()
+# %%
+m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate, num_blocks)
 opt = torch.optim.Adam(m.parameters(), lr = 0.01)
 
 num_params = sum(p.numel() for p in m.parameters())
 print(f'The model has {num_params:,} parameters')
 
-
-# %% [markdown]
-# Train
-
-# %%
-loss_history = []
 num_epochs = 10
-timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-save_path = f"models/{timestamp}_mimiformer.pth"
 
+title = str(input("Enter a run name: "))
 
-# Derive sos and eos from tokenizer
-sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long)
-eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
+title = f"Ep:{num_epochs}, Ba:{batch_size}, Emb:{embedding_size}, Hi:{hidden_size}, D/o:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}"
 
-start = time.time()
-it = 100
-
-# Initialise wandb
 wandb.init(
   project="Mimi's_Mimiformer",
-  name= "Two_headed_Mimiformer",
+  name= title,
   config={
   "dataset": "sentences.txt",
   "epochs": num_epochs,
   "batch_size": batch_size,
   "model_params": num_params,
+  "optimiser": "Adam", 
+  "learning_rate": 0.01,
+  "embedding_size": embedding_size,
+  "hidden_size": hidden_size,
+  "dropout_rate": dropout_rate,
+  "nheads": n_heads,
+  "num_blocks": num_blocks,
   }
 )
 
-
-for epoch in range(num_epochs):
-  for idx, batch in enumerate(dl):
-
-    # Add sos to the beginning of each sequence in the batch
-    x = [torch.cat([sos, b]) for b in batch]
-    y = [torch.cat([b, eos]) for b in batch]
-    # convert batch to tensor
-    x = torch.stack(x)
-    y = torch.stack(y)
-
-    # run our batch through the whole transformer (attention1, ffw, attention2, ffw, linear)
-    p = m.run_six_blocks(x)
-    # calculate cross-entropy loss between predicted token and target token
-    l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
-    # print loss every 100 rows of dataset
-
-    wandb.log({"loss": l.item()})
-    if idx % 100 == 0: 
-      print(f"Loss of {it}:", l.item())
-      it += 100
-      loss_history.append(l.item())
-    # backpropogate for every row
-    l.backward()
-    # What is the optimiser doing?  Why is it called after we have done backward pass?
-    opt.step()
-    opt.zero_grad()
-  
-  # save model after each epoch
-  timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-  torch.save(m.state_dict(), save_path)
-
-end = time.time()
-print(f"Training took {end - start:.2f} seconds")
+# %% [markdown]
+# Train model
 
 # %%
-xaxis = len(loss_history) + 1
-print(xaxis)
-plt.plot(range(1, xaxis), loss_history, marker='o')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Loss every 100 Datapoints')
-plt.grid(True)
-plt.show()
+# Derive sos and eos from tokenizer
+sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long)
+eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long)
+
+start = time.time()
+
+# Training loop
+for epoch in range(num_epochs):
+  for idx, batch in enumerate(dl):
+    # Prepend sos and append eos tokens to sequences
+    x = torch.stack([torch.cat([sos, b]) for b in batch])
+    y = torch.stack([torch.cat([b, eos]) for b in batch])
+
+    start_step = time.time()
+    # Forward pass
+    p = m(x)
+    l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
+    
+    # Backpropagation and optimization
+    l.backward()
+    opt.step()
+    opt.zero_grad()
+
+    end_step = time.time()
+    step_duration = end_step - start_step
+
+    # Log and print
+    wandb.log({"epoch": epoch, "train_loss": l.item(), "step_duration": step_duration})
+
+
+# Save the model and finish
+timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+save_path = f"models/{timestamp}_mimiformer.pth"
+torch.save(m.state_dict(), save_path)
+
+
+print(f"Training took {time.time() - start:.2f} seconds")
+wandb.log({"Training time": time.time() - start})
+wandb.save(save_path)
+wandb.finish()
 
 # %%
 def sample(probs, temperature=1.0):
@@ -314,8 +328,6 @@ def top_p_sample(probs, top_p=0.9):
     sorted_probs[indices_to_remove] = 0
     sorted_probs /= sorted_probs.sum()
     return torch.multinomial(sorted_probs, 1)
-
-  # p = sample(probs, 0.9)
 
   # print("Input:", tokenizer.decode(x.tolist()), "Prediction:", tokenizer.decode(p.tolist()) )
   # x = torch.cat([x, p[-1].unsqueeze(0)])
@@ -348,7 +360,7 @@ p_index = batch_size
 
 while True:
   # run our random start through transformer and get attention matricies out
-  p, attention = m(x)
+  p = m(x)
   # create probabilities from 29 token options
   p = torch.nn.functional.softmax(p, dim=-1)
   probs = p[:, -1]
@@ -366,8 +378,7 @@ while True:
 for i in range(batch_size): 
   generated_text = tokenizer.decode((x[i].tolist()))
   tokens = x[i].tolist()
-  print(tokens)
-  print(f"Generated text for batch {i+1}:", tokenizer.decode(x[i].tolist()))
+  print(f"Batch {i+1}:", tokenizer.decode(x[i].tolist()))
 
 # %%
 def plot_attention_heatmap(attention, tokens):
