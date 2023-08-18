@@ -12,6 +12,6 @@ conda activate foo-bar-env
 conda list
 # utils & server
 pip install pipx
-pipx run nvito
-print "finished"
+pipx run nvitop
 echo "finished"
+!pip install -r requirements.txt
