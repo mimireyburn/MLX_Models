@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.cuda.empty_cache()
 
 # Ensure Deterministic Behavior
 torch.manual_seed(42)
@@ -28,7 +29,9 @@ torch.backends.cudnn.benchmark = False
 # Load Dataset
 dataset = load_dataset("roneneldan/TinyStories")
 
-sample_data = dataset["train"]['text'][:10000]
+num_lines = 50000
+
+sample_data = dataset["train"]['text'][:num_lines]
 
 with open('sentences.txt', 'w') as f:
     for sentence in sample_data:
@@ -50,7 +53,7 @@ with open("sentences.txt", "w") as f:
 # %%
 input_file = 'sentences.txt' 
 prefix = 'sentences'
-vocab_size = 2000
+vocab_size = 5000
 
 spm.SentencePieceTrainer.train(
     input=input_file, 
@@ -80,7 +83,13 @@ tokenizer = Tokenizer()
 # Create Dataset
 
 # %%
-batch_size = 64
+batch_size = 128
+embedding_size = 128
+hidden_size = 128
+mask_dimensions = 1000
+dropout_rate = 0.1
+n_heads = 8
+num_blocks = 1
 
 class Dataset(torch.utils.data.Dataset):
   def __init__(self):
@@ -117,12 +126,6 @@ print("Longest item in dataset:", ds.getMaxLen())
 # Multi-headed Attention Mimi-Former
 
 # %%
-embedding_size = 256
-hidden_size = 64
-mask_dimensions = 1000
-dropout_rate = 0.1
-n_heads = 8
-num_blocks = 1
 
 class Head(nn.Module):
     def __init__(self, embedding_size, n_heads, hidden_size, dropout_rate):
@@ -190,6 +193,10 @@ class Transformer(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, embedding_size)
         )
+
+        self.a_norm = nn.LayerNorm(embedding_size)
+        self.ffn_norm = nn.LayerNorm(embedding_size)
+
         self.final_layer = nn.Linear(embedding_size, vocab_size)
 
     def get_pos_matrix(self, x):
@@ -208,10 +215,11 @@ class Transformer(nn.Module):
     def forward(self, input):
         embedded_input = self.embedding(input)
         pos_encoded_input = embedded_input + self.get_pos_matrix(input)
-        
+        pos_encoded_input = self.a_norm(pos_encoded_input)
         heads_outputs = [head(pos_encoded_input) for head in self.heads]
         concatenated_outputs = torch.cat(heads_outputs, dim=-1)
         output = self.linear(concatenated_outputs)
+        output = self.ffn_norm(output + pos_encoded_input)
         output = self.ffn(output)
         output = self.final_layer(output)
         return output
@@ -220,17 +228,20 @@ class Transformer(nn.Module):
 # Model admin
 
 # %%
+
+learning_rate = 0.01
+
 m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate).to(device)
-opt = torch.optim.Adam(m.parameters(), lr = 0.01)
+opt = torch.optim.SGD(m.parameters(), lr = learning_rate)
 
 num_params = sum(p.numel() for p in m.parameters())
 print(f'The model has {num_params:,} parameters')
 
-num_epochs = 10
+num_epochs = 3
 
 title = str(input("Are you ready to run???: "))
 
-title = f"Ep:{num_epochs}, Ba:{batch_size}, Emb:{embedding_size}, Hi:{hidden_size}, D/o:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}, GPU:{device.type}"
+title = f"Ep:{num_epochs}, Ba:{batch_size}, Em:{embedding_size}, Hi:{hidden_size}, Dr:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}, T:{device.type}, Ds:{num_lines}, O: SGD"
 
 wandb.init(
   project="Mimi's_Mimiformer",
@@ -240,14 +251,15 @@ wandb.init(
   "epochs": num_epochs,
   "batch_size": batch_size,
   "model_params": num_params,
-  "optimiser": "Adam", 
-  "learning_rate": 0.01,
+  "optimiser": "SGD", 
+  "learning_rate": learning_rate,
   "embedding_size": embedding_size,
   "hidden_size": hidden_size,
   "dropout_rate": dropout_rate,
   "nheads": n_heads,
   "num_blocks": num_blocks,
-  "GPU" : device.type
+  "GPU" : device.type, 
+  "Dataset": f"TinyStories{num_lines}"
   }
 )
 
@@ -363,38 +375,6 @@ for i in range(batch_size):
   tokens = x[i].tolist()
   print(f"Batch {i+1}:", tokenizer.decode(x[i].tolist()))
 
+
+
 # %%
-# def plot_attention_heatmap(attention, tokens):
-#     # Convert tensor tokens to list of integers and then decode
-#     decoded_tokens = []
-#     for tok in tokens:
-#         decoded_tokens.append([tokenizer.decode(t.tolist()) for t in tok])
-    
-#     num_layers = len(attention)
-    
-#     # Adjust the subplots layout depending on the number of batches and layers
-#     fig, axes = plt.subplots(batch_size, num_layers, figsize=(4*num_layers, 4*batch_size))
-    
-#     # If there's only one batch and one layer, axes won't be 2D array, so we need to wrap it in a list
-#     if batch_size == 1 and num_layers == 1:
-#         axes = [[axes]]
-#     elif batch_size == 1 or num_layers == 1:
-#         axes = [axes]
-    
-#     for batch_idx in range(batch_size):
-#         for layer_idx in range(num_layers):
-#             ax = axes[batch_idx][layer_idx]
-#             sns.heatmap(attention[layer_idx][batch_idx].detach().numpy(), annot=False, cmap='viridis', ax=ax, xticklabels=decoded_tokens[batch_idx], yticklabels=decoded_tokens[batch_idx])
-#             ax.set_title(f'Batch {batch_idx+1}, Attention Layer {layer_idx + 1}')
-#             # ax.set_xticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
-#             # ax.set_yticks(np.arange(len(decoded_tokens[batch_idx])) + .5, minor=False)
-#             ax.tick_params(axis='x', rotation=45)
-#             ax.tick_params(axis='y', rotation=0)
-
-#     plt.tight_layout()
-#     plt.show()
-
-# # Assuming that you've tokenized 'x' and the tokens are stored in a variable called 'tokens'
-# plot_attention_heatmap(attention, tokens)
-
-
