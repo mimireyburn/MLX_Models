@@ -1,3 +1,4 @@
+# %% 
 import random
 import torch
 import math
@@ -11,6 +12,7 @@ import time
 import wandb
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.cuda.empty_cache()
@@ -29,7 +31,7 @@ torch.backends.cudnn.benchmark = False
 # Load Dataset
 dataset = load_dataset("roneneldan/TinyStories")
 
-num_lines = 50000
+num_lines = 100000
 
 sample_data = dataset["train"]['text'][:num_lines]
 
@@ -84,11 +86,11 @@ tokenizer = Tokenizer()
 
 # %%
 batch_size = 128
-embedding_size = 128
-hidden_size = 128
+embedding_size = 512
+hidden_size = 64
 mask_dimensions = 1000
 dropout_rate = 0.1
-n_heads = 8
+n_heads = 4
 num_blocks = 1
 
 class Dataset(torch.utils.data.Dataset):
@@ -224,24 +226,28 @@ class Transformer(nn.Module):
         output = self.final_layer(output)
         return output
 
-# %% [markdown]
+# %%
 # Model admin
 
-# %%
-
-learning_rate = 0.01
-
 m = Transformer(embedding_size, n_heads, hidden_size, dropout_rate).to(device)
-opt = torch.optim.SGD(m.parameters(), lr = learning_rate)
 
 num_params = sum(p.numel() for p in m.parameters())
 print(f'The model has {num_params:,} parameters')
 
-num_epochs = 3
 
-title = str(input("Are you ready to run???: "))
+# %%
 
-title = f"Ep:{num_epochs}, Ba:{batch_size}, Em:{embedding_size}, Hi:{hidden_size}, Dr:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}, T:{device.type}, Ds:{num_lines}, O: SGD"
+learning_rate = 0.001
+
+optimiser = "Adam"
+opt = torch.optim.Adam(m.parameters(), lr = learning_rate)
+
+num_epochs = 1
+
+
+# title = str(input("Are you ready to run???: "))
+
+title = f"Ep:{num_epochs}, Ba:{batch_size}, Em:{embedding_size}, Hi:{hidden_size}, Dr:{dropout_rate}, He:{n_heads}, Bl:{num_blocks}, T:{device.type}, Ds:{num_lines}, O: {optimiser}, Lr:{learning_rate}"
 
 wandb.init(
   project="Mimi's_Mimiformer",
@@ -251,7 +257,7 @@ wandb.init(
   "epochs": num_epochs,
   "batch_size": batch_size,
   "model_params": num_params,
-  "optimiser": "SGD", 
+  "optimiser": optimiser, 
   "learning_rate": learning_rate,
   "embedding_size": embedding_size,
   "hidden_size": hidden_size,
@@ -271,6 +277,8 @@ wandb.init(
 sos = torch.tensor([tokenizer.SOS_TOKEN], dtype=torch.long).to(device)
 eos  = torch.tensor([tokenizer.EOS_TOKEN], dtype=torch.long).to(device)
 
+scaler = GradScaler()
+
 start = time.time()
 
 # Training loop
@@ -283,12 +291,17 @@ for epoch in range(num_epochs):
 
     start_step = time.time()
     # Forward pass
-    p = m(x)
-    l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
+    with autocast():
+      p = m(x)
+      l = torch.nn.functional.cross_entropy(p.view(-1, p.size(-1)), y.view(-1))
     
     # Backpropagation and optimization
-    l.backward()
-    opt.step()
+    # Scales the loss, and calls backward() to create scaled gradients
+    scaler.scale(l).backward()
+    # Unscales gradients and calls or skips optimizer.step()
+    scaler.step(opt)
+    # Updates the scale for next iteration
+    scaler.update()
     opt.zero_grad()
 
     end_step = time.time()
@@ -341,7 +354,7 @@ for b in range(batch_size):
   random_token = random.choice(all_tokens)
 
   # Convert the token to its corresponding ID
-  x = torch.tensor([tokenizer.sp.piece_to_id(random_token)])
+  x = torch.tensor([tokenizer.sp.piece_to_id(random_token)]).to(device)
   # print(tokenizer.decode(x.tolist()))
 
   x = torch.cat([sos, x]) 
@@ -369,11 +382,11 @@ while True:
   
   # unsqueeze to get the right dimensions for torch.cat
   x = torch.cat([x, p], dim=1)
-  if x.size(1) ==20: break
+  if x.size(1) ==50: break
 for i in range(batch_size): 
   generated_text = tokenizer.decode((x[i].tolist()))
   tokens = x[i].tolist()
-  print(f"Batch {i+1}:", tokenizer.decode(x[i].tolist()))
+print(tokenizer.decode(x[0].tolist()))
 
 
 
