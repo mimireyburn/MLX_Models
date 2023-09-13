@@ -1,10 +1,10 @@
-# mlx2-models
-Founders &amp; Coders | Models and experiments 
+# Some Learnings from MLX Institute, Founders and Coders
+My handwritten models and experiments from the intensive ML program at FAC.
 
 ## Transformers/
 *Transformer Architecture | Week 4 Project at MLX Institute, Founders and Coders*
 
-A handwritten script for writing new stories. A Transformer architecture containing Multi-Headed Self-Attention and tracking with Weights and Biases, trained on the TinyStories dataset. 
+A GPT for generating new stories. A Transformer architecture containing Multi-Headed Self-Attention and tracking with Weights and Biases, trained on the TinyStories dataset. 
 
 ## PCA/
 *CNNs and Autoencoders | Week 2 Project at MLX Institute, Founders and Coders*
