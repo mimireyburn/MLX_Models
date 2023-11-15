@@ -1,4 +1,4 @@
-# Some Learnings from MLX Institute, Founders and Coders
+# Architectures | MLX Institute, Founders and Coders
 My handwritten models and experiments from the intensive ML program at FAC.
 
 ## Transformers
