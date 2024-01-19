@@ -1,0 +1,6 @@
+docker_compose([
+  "./docker-compose-data.yml"
+])
+
+dc_resource("postgres",   labels=["data"])
+dc_resource("pgadmin",    labels=["data"])
